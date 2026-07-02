@@ -32,6 +32,9 @@ export async function GET(request: Request) {
         maxAge: 60 * 60 * 24 * 365, // 1 year
     })
 
-    // Land back on the tool, now unlocked.
-    return Response.redirect(new URL('/', request.url), 302)
+    // Land back on the tool, now unlocked. Use a relative Location so the browser
+    // resolves it against the public domain — building an absolute URL from
+    // request.url would point at the container's internal host (localhost:3000)
+    // when running behind a reverse proxy.
+    return new Response(null, { status: 302, headers: { Location: '/' } })
 }
