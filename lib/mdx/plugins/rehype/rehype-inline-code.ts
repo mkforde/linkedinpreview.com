@@ -5,7 +5,7 @@
  */
 import type { RehypeShikiCoreOptions } from '@shikijs/rehype/core'
 import type { Root } from 'hast'
-import { bundledLanguages, getHighlighter, type Highlighter } from 'shiki'
+import { getHighlighter, type Highlighter } from 'shiki'
 import type { Plugin } from 'unified'
 import { visit } from 'unist-util-visit'
 
@@ -16,6 +16,11 @@ const inlineShikiRegex = /(.*){:(.*)}$/
 const themeNames = Object.values(DEFAULT_SHIKI_THEMES)
 const themeKeys = Object.keys(DEFAULT_SHIKI_THEMES)
 
+// Only the languages actually used for inline code in blog content. Loading all
+// ~200 bundled Shiki grammars (`Object.keys(bundledLanguages)`) made the
+// production build take ~25 minutes; this keeps it to a couple of minutes.
+const INLINE_CODE_LANGS = ['html', 'bash', 'shell', 'json', 'js', 'jsx', 'ts', 'tsx', 'css', 'md', 'python', 'yaml']
+
 export const rehypeInlineCode: Plugin<[RehypeShikiCoreOptions], Root> = () => {
     let promise: Promise<Highlighter>
 
@@ -23,7 +28,7 @@ export const rehypeInlineCode: Plugin<[RehypeShikiCoreOptions], Root> = () => {
         if (!promise) {
             promise = getHighlighter({
                 themes: themeNames,
-                langs: Object.keys(bundledLanguages),
+                langs: INLINE_CODE_LANGS,
             })
         }
 
