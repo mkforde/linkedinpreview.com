@@ -5,7 +5,7 @@ import { z } from 'zod'
 
 import { env } from '@/env.mjs'
 import { AI_ERROR_CODES } from '@/config/ai'
-import { assertSameOrigin, checkIpRateLimit } from '@/lib/ai-guard'
+import { assertAiAccess, assertSameOrigin, checkIpRateLimit, isAiGateActive } from '@/lib/ai-guard'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { createClient } from '@/lib/supabase/server'
 
@@ -85,6 +85,10 @@ export async function POST(request: Request) {
     const originBlock = assertSameOrigin(request)
     if (originBlock) return originBlock
 
+    // Gate the endpoint to the operator when AI_ACCESS_TOKEN is configured.
+    const accessBlock = await assertAiAccess()
+    if (accessBlock) return accessBlock
+
     // Per-IP backstop ahead of the per-user Supabase limit (blunts bursts).
     const ipLimit = checkIpRateLimit(request, { id: 'chat', limit: 30, windowMs: 10 * 60 * 1000 })
     if (!ipLimit.allowed) {
@@ -118,37 +122,41 @@ export async function POST(request: Request) {
         })
     }
 
-    // Auth: validate the anonymous session
-    const supabase = await createClient()
-    const {
-        data: { user },
-    } = await supabase.auth.getUser()
+    // When the operator gate is active the caller is already restricted to you,
+    // so skip the Supabase anonymous-auth + per-user rate limits entirely.
+    if (!isAiGateActive()) {
+        // Auth: validate the anonymous session
+        const supabase = await createClient()
+        const {
+            data: { user },
+        } = await supabase.auth.getUser()
 
-    if (!user) {
-        return new Response(JSON.stringify({ error: 'Authentication required', code: AI_ERROR_CODES.AUTH_REQUIRED }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-        })
+        if (!user) {
+            return new Response(
+                JSON.stringify({ error: 'Authentication required', code: AI_ERROR_CODES.AUTH_REQUIRED }),
+                { status: 401, headers: { 'Content-Type': 'application/json' } },
+            )
+        }
+
+        // Rate limiting: first message = generation, subsequent = refinement
+        const action = parsed.data.messages.length === 1 ? 'generation' : 'refinement'
+        const rateLimit = await checkRateLimit(supabase, action)
+
+        if (!rateLimit.allowed) {
+            return new Response(
+                JSON.stringify({
+                    error: `Daily ${action} limit reached`,
+                    code: AI_ERROR_CODES.RATE_LIMITED,
+                    action,
+                    resetAt: rateLimit.resetAt,
+                    remaining: rateLimit.remaining,
+                }),
+                { status: 429, headers: { 'Content-Type': 'application/json' } },
+            )
+        }
     }
 
-    // Rate limiting: first message = generation, subsequent = refinement
-    const action = parsed.data.messages.length === 1 ? 'generation' : 'refinement'
-    const rateLimit = await checkRateLimit(supabase, action)
-
-    if (!rateLimit.allowed) {
-        return new Response(
-            JSON.stringify({
-                error: `Daily ${action} limit reached`,
-                code: AI_ERROR_CODES.RATE_LIMITED,
-                action,
-                resetAt: rateLimit.resetAt,
-                remaining: rateLimit.remaining,
-            }),
-            { status: 429, headers: { 'Content-Type': 'application/json' } },
-        )
-    }
-
-    const openai = createOpenAI({ apiKey: env.LLM_API_KEY })
+    const openai = createOpenAI({ apiKey: env.LLM_API_KEY, baseURL: env.LLM_BASE_URL })
     const model = env.LLM_MODEL ?? 'gpt-4o-mini'
 
     let modelMessages: Awaited<ReturnType<typeof convertToModelMessages>>
@@ -162,7 +170,7 @@ export async function POST(request: Request) {
     }
 
     const result = streamText({
-        model: openai(model),
+        model: openai.chat(model),
         system: SYSTEM_PROMPT,
         messages: modelMessages,
     })

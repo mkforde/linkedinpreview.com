@@ -1,10 +1,11 @@
 import { createOpenAI } from '@ai-sdk/openai'
+import type { User } from '@supabase/supabase-js'
 import { generateObject } from 'ai'
 import { z } from 'zod'
 
 import { env } from '@/env.mjs'
 import { AI_ERROR_CODES } from '@/config/ai'
-import { assertSameOrigin } from '@/lib/ai-guard'
+import { assertAiAccess, assertSameOrigin, isAiGateActive } from '@/lib/ai-guard'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { createClient } from '@/lib/supabase/server'
 
@@ -40,6 +41,9 @@ export async function POST(request: Request) {
     const originBlock = assertSameOrigin(request)
     if (originBlock) return originBlock
 
+    const accessBlock = await assertAiAccess()
+    if (accessBlock) return accessBlock
+
     let body: unknown
     try {
         body = await request.json()
@@ -52,31 +56,37 @@ export async function POST(request: Request) {
         return Response.json({ error: parsed.error.issues[0]?.message ?? 'Invalid input' }, { status: 400 })
     }
 
-    // Auth: validate the anonymous session
-    const supabase = await createClient()
-    const {
-        data: { user },
-    } = await supabase.auth.getUser()
+    // When the operator gate is active, skip Supabase auth + rate limiting (and the
+    // analytics insert below). Otherwise validate the anonymous session and cap usage.
+    const supabase = isAiGateActive() ? null : await createClient()
+    let user: User | null = null
 
-    if (!user) {
-        return Response.json({ error: 'Authentication required', code: AI_ERROR_CODES.AUTH_REQUIRED }, { status: 401 })
+    if (supabase) {
+        user = (await supabase.auth.getUser()).data.user
+
+        if (!user) {
+            return Response.json(
+                { error: 'Authentication required', code: AI_ERROR_CODES.AUTH_REQUIRED },
+                { status: 401 },
+            )
+        }
+
+        // Rate limit: 20 analyses per day
+        const rateLimit = await checkRateLimit(supabase, 'analysis')
+        if (!rateLimit.allowed) {
+            return Response.json(
+                { error: 'Daily analysis limit reached', code: AI_ERROR_CODES.RATE_LIMITED, resetAt: rateLimit.resetAt },
+                { status: 429 },
+            )
+        }
     }
 
-    // Rate limit: 20 analyses per day
-    const rateLimit = await checkRateLimit(supabase, 'analysis')
-    if (!rateLimit.allowed) {
-        return Response.json(
-            { error: 'Daily analysis limit reached', code: AI_ERROR_CODES.RATE_LIMITED, resetAt: rateLimit.resetAt },
-            { status: 429 },
-        )
-    }
-
-    const openai = createOpenAI({ apiKey: env.LLM_API_KEY })
+    const openai = createOpenAI({ apiKey: env.LLM_API_KEY, baseURL: env.LLM_BASE_URL })
 
     let object: z.infer<typeof analysisSchema>
     try {
         const result = await generateObject({
-            model: openai(env.LLM_MODEL ?? 'gpt-4o-mini'),
+            model: openai.chat(env.LLM_MODEL ?? 'gpt-4o-mini'),
             schema: analysisSchema,
             system: `You are a LinkedIn content analyst. Evaluate posts for professional impact.
 
@@ -109,34 +119,37 @@ ${parsed.data.postText}
         return Response.json({ error: 'Failed to analyze post' }, { status: 500 })
     }
 
-    // Store the result - fail silently if the insert fails
-    const { error: insertError } = await supabase.from('post_analyses').insert({
-        user_id: user.id,
-        post_text: parsed.data.postText,
-        content_length: parsed.data.contentLength,
-        line_count: parsed.data.lineCount,
-        hashtag_count: parsed.data.hashtagCount,
-        emoji_count: parsed.data.emojiCount,
-        has_formatting: parsed.data.hasFormatting,
-        has_image: parsed.data.hasImage,
-        score: object.score,
-        hook_score: object.hook_score,
-        readability_score: object.readability_score,
-        cta_score: object.cta_score,
-        engagement_score: object.engagement_score,
-        strengths: object.strengths,
-        improvements: object.improvements,
-        topics: object.topics,
-        sentiment: object.sentiment,
-        category: object.category,
-        tone: object.tone,
-        has_hook: object.has_hook,
-        has_cta: object.has_cta,
-        hook_quality: object.hook_quality,
-    })
+    // Store the result - fail silently if the insert fails. Skipped when the
+    // operator gate is active (no Supabase session / user to attribute it to).
+    if (supabase && user) {
+        const { error: insertError } = await supabase.from('post_analyses').insert({
+            user_id: user.id,
+            post_text: parsed.data.postText,
+            content_length: parsed.data.contentLength,
+            line_count: parsed.data.lineCount,
+            hashtag_count: parsed.data.hashtagCount,
+            emoji_count: parsed.data.emojiCount,
+            has_formatting: parsed.data.hasFormatting,
+            has_image: parsed.data.hasImage,
+            score: object.score,
+            hook_score: object.hook_score,
+            readability_score: object.readability_score,
+            cta_score: object.cta_score,
+            engagement_score: object.engagement_score,
+            strengths: object.strengths,
+            improvements: object.improvements,
+            topics: object.topics,
+            sentiment: object.sentiment,
+            category: object.category,
+            tone: object.tone,
+            has_hook: object.has_hook,
+            has_cta: object.has_cta,
+            hook_quality: object.hook_quality,
+        })
 
-    if (insertError) {
-        console.error('Failed to store analysis:', insertError.message)
+        if (insertError) {
+            console.error('Failed to store analysis:', insertError.message)
+        }
     }
 
     return Response.json({ success: true })

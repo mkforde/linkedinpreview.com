@@ -7,6 +7,52 @@
  * authoritative limit remains the per-user Supabase rate limit.
  */
 
+import { cookies } from 'next/headers'
+
+import { env } from '@/env.mjs'
+
+// Cookie that unlocks the AI endpoints. Set by /api/ai-unlock when the correct
+// token is presented; checked by assertAiAccess() on every AI request.
+export const AI_ACCESS_COOKIE = 'ai_access'
+
+// True when the operator-only gate is configured. When active, the endpoints are
+// restricted to you via the unlock cookie, so the Supabase anonymous-auth and
+// per-user rate limits (which only exist to protect a public endpoint) are
+// redundant and can be skipped — no Supabase required for the AI to work.
+export function isAiGateActive(): boolean {
+    return !!env.AI_ACCESS_TOKEN
+}
+
+// Constant-time string comparison to avoid leaking the token via timing.
+function safeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false
+    let mismatch = 0
+    for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i)
+    return mismatch === 0
+}
+
+/**
+ * Restrict the AI endpoints to the operator only.
+ *
+ * When AI_ACCESS_TOKEN is unset the endpoints stay open (upstream OSS behavior).
+ * When it is set, a caller must present the matching unlock cookie — obtained
+ * once per browser by visiting /api/ai-unlock?token=<AI_ACCESS_TOKEN>. This
+ * gates the public deployment to just you without adding a login UI.
+ */
+export async function assertAiAccess(): Promise<Response | null> {
+    const token = env.AI_ACCESS_TOKEN
+    if (!token) return null // feature open when no token is configured
+
+    const provided = (await cookies()).get(AI_ACCESS_COOKIE)?.value
+    if (!provided || !safeEqual(provided, token)) {
+        return new Response(JSON.stringify({ error: 'Forbidden', code: 'AI_LOCKED' }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' },
+        })
+    }
+    return null
+}
+
 function forbidden(): Response {
     return new Response(JSON.stringify({ error: 'Forbidden' }), {
         status: 403,
