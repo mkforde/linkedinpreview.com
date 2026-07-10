@@ -8,6 +8,7 @@ import { AI_ERROR_CODES } from '@/config/ai'
 import { assertAiAccess, assertSameOrigin, checkIpRateLimit, isAiGateActive } from '@/lib/ai-guard'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { createClient } from '@/lib/supabase/server'
+import { HUMANIZER_SKILL } from '@/app/api/chat/humanizer-prompt'
 
 const SYSTEM_PROMPT = `You are an expert LinkedIn content writer. You ONLY write and refine LinkedIn posts. Nothing else.
 
@@ -61,7 +62,13 @@ You can use **bold** and *italic* to add emphasis. Follow these rules strictly:
 
 - Always output the COMPLETE updated post - never output diffs, partial edits, or just the changed section
 - Do not include any preamble, explanation, or commentary - output ONLY the post text
-- When the user asks for changes, apply them to the latest version of the post and output the full result`
+- When the user asks for changes, apply them to the latest version of the post and output the full result
+
+## Humanizer Skill
+
+Apply the following skill to every post you write. Where its process conflicts with the Multi-Turn Instructions above (draft/audit/final deliverables), run that draft-audit-revise loop internally and still output ONLY the final post text.
+
+${HUMANIZER_SKILL}`
 
 const messageSchema = z.object({
     role: z.enum(['user', 'assistant']),
